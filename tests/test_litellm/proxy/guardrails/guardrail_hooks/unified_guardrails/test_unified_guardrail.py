@@ -1040,6 +1040,53 @@ class TestStreamingTransform:
         assert payload["error"]["message"] == "stream_transform_underflow"
         assert payload["id"] == "req-1"
 
+    @pytest.mark.asyncio
+    async def test_emit_streaming_http_error_anthropic_messages_yields_sse_error_frame(self):
+        """Regression: for `/v1/messages` streams the block HTTPException raised by
+        the default Bedrock guardrail (`disable_exception_on_block=False`) must be
+        emitted as an in-stream `event: error` SSE frame the client can parse. A
+        bare re-raise would never reach the client once the SSE headers or a
+        keepalive ping have flushed, so Claude Code would finish without seeing
+        the block."""
+        handler = UnifiedLLMGuardrails()
+        exc = unified_module.HTTPException(
+            status_code=400,
+            detail={"error": "content blocked", "message": "policy violation"},
+        )
+
+        emitted = []
+        async for item in handler._emit_streaming_http_error(
+            exc,
+            call_type=CallTypes.anthropic_messages.value,
+            responses_so_far=[b"event: message_start\ndata: {}\n\n"],
+            request_data={},
+        ):
+            emitted.append(item)
+
+        assert len(emitted) == 1
+        frame = emitted[0]
+        assert isinstance(frame, bytes)
+        assert frame.startswith(b"event: error\n")
+        assert b'"type": "guardrail_error"' in frame
+        assert b"content blocked" in frame
+
+    @pytest.mark.asyncio
+    async def test_emit_streaming_http_error_unknown_call_type_reraises(self):
+        """Anything outside A2A / anthropic_messages still re-raises so the proxy
+        can surface a proper error response before headers flush."""
+        handler = UnifiedLLMGuardrails()
+        exc = unified_module.HTTPException(status_code=500, detail="boom")
+
+        with pytest.raises(unified_module.HTTPException) as exc_info:
+            async for _ in handler._emit_streaming_http_error(
+                exc,
+                call_type=CallTypes.completion.value,
+                responses_so_far=[],
+                request_data={},
+            ):
+                pass
+        assert exc_info.value is exc
+
     def test_final_chunk_preserves_per_choice_finish_reason(self):
         """The final flush must carry each choice's own finish_reason, not
         choices[0]'s, for n > 1 (e.g. "stop" vs "length")."""

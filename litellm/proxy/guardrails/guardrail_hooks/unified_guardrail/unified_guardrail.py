@@ -41,6 +41,11 @@ if TYPE_CHECKING:
 # Call types that stream JSON-RPC events (A2A); guardrail HTTPException is emitted as in-stream error
 A2A_CALL_TYPES: Final = (CallTypes.asend_message, CallTypes.send_message)
 
+# Call types that stream Anthropic-format SSE (`/v1/messages`). Once the response headers or a
+# keepalive ping have flushed, a raise never reaches the client, so a guardrail HTTPException has
+# to travel as an in-stream `event: error` frame the client can read.
+ANTHROPIC_MESSAGES_CALL_TYPES: Final = (CallTypes.anthropic_messages, CallTypes.aanthropic_messages)
+
 GUARDRAIL_NAME: Final = "unified_llm_guardrails"
 
 
@@ -70,6 +75,16 @@ def _chunk_choices(item: object) -> Sequence[object]:
 class _StreamTerminated(Exception):
     """Internal signal that the incremental transform stream has already emitted
     its terminal chunks (block message or in-stream error) and must stop."""
+
+
+def _safe_call_type(call_type: str | None) -> CallTypes | None:
+    """Map a call_type string to a CallTypes enum; return None for unknown or missing values."""
+    if call_type is None:
+        return None
+    try:
+        return CallTypes(call_type)
+    except ValueError:
+        return None
 
 
 def _get_a2a_request_id(responses_so_far: Sequence[object], request_data: dict) -> str | None:
@@ -409,12 +424,28 @@ class UnifiedLLMGuardrails(CustomLogger):
         responses_so_far: Sequence[object],
         request_data: dict,
     ) -> AsyncGenerator[object, None]:
-        """Surface a mid-stream HTTPException. For A2A call types the response has
-        already started, so emit an in-stream JSON-RPC error chunk; otherwise
+        """Surface a mid-stream HTTPException in whatever frame the client is reading.
+
+        For A2A call types the response has already started, so emit an in-stream JSON-RPC error
+        chunk. For Anthropic `/v1/messages` streams the headers/keepalive ping may have flushed, so
+        emit an Anthropic `event: error` SSE frame the client can parse (the default Bedrock block
+        raises HTTPException, and a raise past the first ping never reaches the client). Otherwise
         re-raise so the proxy can report it.
         """
-        if call_type is not None and CallTypes(call_type) in A2A_CALL_TYPES:
+        mapped: Final = _safe_call_type(call_type)
+        if mapped in A2A_CALL_TYPES:
             yield _a2a_jsonrpc_error_chunk(exc, _get_a2a_request_id(responses_so_far, request_data))
+            return
+        if mapped in ANTHROPIC_MESSAGES_CALL_TYPES:
+            from litellm.proxy.common_request_processing import _serialize_http_exception_detail
+            from litellm.proxy.guardrails.anthropic_sse import anthropic_sse_error_frames
+
+            message, _ = _serialize_http_exception_detail(exc.detail)
+            is_block: Final = exc.status_code == 400 and isinstance(exc.detail, Mapping)
+            for error_frame in anthropic_sse_error_frames(
+                message if is_block else f"{exc.status_code}: {message}"
+            ):
+                yield error_frame
             return
         raise exc
 
@@ -1070,11 +1101,13 @@ class UnifiedLLMGuardrails(CustomLogger):
                     return
                 except HTTPException as e:
                     # Response already started (we already yielded chunks); cannot send 400.
-                    # For A2A, yield an in-stream JSON-RPC error so the client sees it.
-                    if call_type is not None and CallTypes(call_type) in A2A_CALL_TYPES:
-                        yield _a2a_jsonrpc_error_chunk(e, _get_a2a_request_id(responses_so_far, request_data))
-                        return
-                    raise
+                    # A2A and Anthropic `/v1/messages` streams get an in-stream error frame the
+                    # client can parse; anything else re-raises.
+                    async for error_item in self._emit_streaming_http_error(
+                        e, call_type, responses_so_far, request_data
+                    ):
+                        yield error_item
+                    return
                 chunks_yielded = True
                 responses_yielded.append(original_item)
                 yield original_item
@@ -1133,7 +1166,7 @@ class UnifiedLLMGuardrails(CustomLogger):
                     yield block_chunk
                 return
             except HTTPException as e:
-                if call_type is not None and CallTypes(call_type) in A2A_CALL_TYPES:
-                    yield _a2a_jsonrpc_error_chunk(e, _get_a2a_request_id(responses_so_far, request_data))
-                else:
-                    raise
+                async for error_item in self._emit_streaming_http_error(
+                    e, call_type, responses_so_far, request_data
+                ):
+                    yield error_item
